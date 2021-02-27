@@ -143,11 +143,80 @@ STEAL + NO FORCE: Write Ahead Log
 
 在数据被写入磁盘前和事务提交前，先将日志写入磁盘
 
-在CheckPoints时将缓冲区中的数据写入磁盘，当提交时需要暂停所有事务确保一致性
+* 在CheckPoints时将缓冲区中的数据写入磁盘，当提交时需要停止接受新事物并等待执行中的事务全部结束，再将数据刷入磁盘。暂停事务会对效率和性能造成很大影响。
+* 一个较好的方案是：当系统执行CheckPoints的时候暂停**写事务**(禁止获取数据锁)，读事务可以继续执行，不需要等待所有事务结束。会导致内存-磁盘数据不一致，因此需要记录正在执行的事务(ATT)，内存中的脏页(DPT)。但这依然不是一个理想的方案，因为暂停事务依然会影响性能。
+* FUZZY CHECKPOINTS : 刷入磁盘和事务同时进行。在日志中记录Checkpoints-begin和Checkpoints-end(包括ATT, DPT)，当恢复时，从最新的一次checkpoints向下记录所有事务，并redo所有记录，将commit的事务刷入磁盘，其余的事务撤销。
 
-Fuzzy CheckPoints:
+如何提升DBMS在undo时的性能
 
+1. 在内存中记录需要回滚的事务，但直到新的事务读写该部分时再修改(Lazy Rollback)
+2. 避免使用长事务
 
+#### Join及优化
 
+* 为什么需要join: 将数据储存到关系数据库时，为了减少数据的冗余，节约内存，需要将数据拆分规范化。因此需要join来重建完整数据。
 
+Join算法：
 
+假设左表**M pages，m tuples**, 右表**N pages, n tuples**
+
+1. Nested Loop Join
+
+    1. Simple
+
+        从左表中逐项取数据和右表进行比较，需要大量读取磁盘，效率极低。
+
+        cost: M+(m*N)
+
+    2. Block
+
+        先预先从磁盘中读取部分元组存入内存，再和右表比较，如每次取一页。
+
+        cost: M + (M*N)
+
+    3. Index
+
+        利用索引，可以避免每次比较都需要遍历右表，直接寻找到对应的元组，假设每次索引的代价是常数C
+
+        cost: M + (m*C)
+
+2. Sort-Merge Join
+
+    将两表按照对应数据排序，然后将数据相等的连接
+
+    Sort Cost (R): $2M(1 + ⌈ \log B-1 ⌈M / B⌉ ⌉)$
+    Sort Cost (S): $2N(1 + ⌈ \log B-1 ⌈N / B⌉ ⌉)$
+    Merge Cost: $(M + N)$
+    Total Cost: Sort + Merge
+
+    最差的情况是两个表中的所有元组对应数据都相等。
+
+    在实际数据库中，元组按主键都是排好序的，因此可以省去排序的过程
+
+3. Hash Join
+
+    相同的值通过hash一定能映射到同样的区域。因此通过hash，只需要比较该区域的值即可。
+
+    * 阶段一：Build
+
+        用hash函数h1扫描右表，建立哈希映射表
+
+    * 阶段二：Probe
+
+        对左表中的对应数据依次hash，在映射表中寻找对应的元组
+
+    可以通过布隆过滤器进行优化(Bloom Filter)，在查找映射表之前可以先检查过滤器，如果过滤器中没有，则说明没有对应的数据。
+
+    cost: $B(B-1)$
+
+    * B-1 "spill partitions" in Phase #1
+    * Each should be no more than B blocks big
+
+    如果没有足够的内存储存哈希表：Grace Hash Join
+
+    * 用相同的哈希函数分别对左右表建立哈希映射表，将映射表中的对应区域读入内存执行nested loop join
+
+    * 如果对应区域依然不能存入内存，可以用另一个哈希函数h2将较大的区域分割开再存入内存
+    * cost: $3(M+N)$
+
+Hash join 几乎总是最优的，除非数据已经是排好序的
